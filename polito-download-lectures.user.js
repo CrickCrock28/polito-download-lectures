@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Polito VC – lecture checkboxes & download
 // @namespace    https://tampermonkey.net/
-// @version      1.0
+// @version      1.2
 // @description  Lecture completion checkboxes & video download for Polito Virtual Classroom
 // @match        https://didattica.polito.it/pls/portal30/sviluppo.pagina_corso_2023.main*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      video.polito.it
 // @connect      didattica.polito.it
+// @connect      ssrweb.zoom.us
+// @connect      *.zoom.us
 // @updateURL    https://raw.githubusercontent.com/CrickCrock28/polito-download-lectures/main/polito-download-lectures.user.js
 // @downloadURL  https://raw.githubusercontent.com/CrickCrock28/polito-download-lectures/main/polito-download-lectures.user.js
 // ==/UserScript==
@@ -71,21 +73,73 @@
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }
 
-  function fetchVideoUrl(bbbId, idInc, idIncProv) {
+  function gmRequest(details) {
     return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'POST',
-        url: VC_TPL_URL,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        data: 'p_bbbid=' + encodeURIComponent(bbbId) +
-              '&p_id_inc=' + encodeURIComponent(idInc) +
-              '&p_id_inc_prov=' + encodeURIComponent(idIncProv),
-        onload: (resp) => {
-          const m = resp.responseText.match(/<source[^>]+src="([^"]+)"/);
-          resolve(m ? m[1] : null);
-        },
-        onerror: () => reject(new Error('Failed to fetch video URL')),
+      GM_xmlhttpRequest(Object.assign({
+        onload: (resp) => resolve(resp),
+        onerror: () => reject(new Error('request failed')),
+        ontimeout: () => reject(new Error('request timed out')),
+      }, details));
+    });
+  }
+
+  function fetchVCTpl(bbbId, idInc, idIncProv) {
+    return gmRequest({
+      method: 'POST',
+      url: VC_TPL_URL,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      data: 'p_bbbid=' + encodeURIComponent(bbbId) +
+            '&p_id_inc=' + encodeURIComponent(idInc) +
+            '&p_id_inc_prov=' + encodeURIComponent(idIncProv),
+    }).then((resp) => resp.responseText);
+  }
+
+  function parseMedia(html) {
+    const mp4 = html.match(/<source[^>]+src="([^"]+)"/);
+    if (mp4) return { kind: 'mp4', url: mp4[1] };
+    const zoom = html.match(/href="(https:\/\/[^"]*?zoom\.us\/rec\/play\/[^"]+)"/);
+    if (zoom) return { kind: 'zoom', url: zoom[1] };
+    return null;
+  }
+
+  function resolveZoomMp4(playUrl) {
+    const host = new URL(playUrl).host;
+    return gmRequest({ method: 'GET', url: playUrl })
+      .then((resp) => {
+        const m = resp.responseText.match(/fileId\s*:\s*'([^']+)'/);
+        if (!m) throw new Error('Zoom token not found');
+        const infoUrl = 'https://' + host + '/nws/recording/1.0/play/info/' +
+          encodeURIComponent(m[1]) + '?originDomain=' + host;
+        return gmRequest({ method: 'GET', url: infoUrl });
+      })
+      .then((resp) => {
+        const data = JSON.parse(resp.responseText);
+        const url = data && data.result && data.result.mp4Url;
+        if (!url) throw new Error('Zoom MP4 URL not available');
+        return url;
       });
+  }
+
+  function downloadBlob(url, name, dlCtx) {
+    return gmRequest({
+      method: 'GET',
+      url: url,
+      responseType: 'blob',
+      onprogress: (p) => {
+        if (p.total > 0) {
+          dlCtx.pct = Math.round((p.loaded / p.total) * 100);
+          dlCtx.setVisual('refresh', dlCtx.pct + '%');
+        }
+      },
+    }).then((resp) => {
+      const blobUrl = URL.createObjectURL(resp.response);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
     });
   }
 
@@ -138,48 +192,22 @@
       const prefix = String(idx).padStart(2, '0');
       const lessonName = prefix + '_' + a.textContent.trim().replace(/[^a-zA-Z0-9 _-]/g, '').replace(/\s+/g, '_');
 
-      fetchVideoUrl(bbbId, idInc, idIncProv)
-        .then((url) => {
-          if (!url) {
-            activeDownloads.delete(bbbId);
-            dlCtx.setVisual('fail');
-            alert('Could not find video URL in response');
-            setTimeout(() => dlCtx.setVisual('save'), 3000);
-            return;
+      fetchVCTpl(bbbId, idInc, idIncProv)
+        .then((html) => {
+          const media = parseMedia(html);
+          if (!media) throw new Error('no downloadable media found');
+          if (media.kind === 'zoom') {
+            dlCtx.setVisual('refresh', '…');
+            const playUrl = media.url;
+            return resolveZoomMp4(playUrl).then((mp4Url) => downloadBlob(mp4Url, lessonName + '.mp4', dlCtx))
+              .catch(() => { window.open(playUrl, '_blank', 'noopener'); });
           }
-          dlCtx.setVisual('refresh', '…');
-
-          GM_xmlhttpRequest({
-            method: 'GET',
-            url: url,
-            responseType: 'blob',
-            onprogress: (p) => {
-              if (p.total > 0) {
-                dlCtx.pct = Math.round((p.loaded / p.total) * 100);
-                dlCtx.setVisual('refresh', dlCtx.pct + '%');
-              }
-            },
-            onload: (resp) => {
-              activeDownloads.delete(bbbId);
-              const blob = resp.response;
-              const blobUrl = URL.createObjectURL(blob);
-              const link = document.createElement('a');
-              link.href = blobUrl;
-              link.download = lessonName + '.mp4';
-              document.body.appendChild(link);
-              link.click();
-              link.remove();
-              URL.revokeObjectURL(blobUrl);
-              dlCtx.setVisual('ok');
-              setTimeout(() => dlCtx.setVisual('save'), 3000);
-            },
-            onerror: () => {
-              activeDownloads.delete(bbbId);
-              dlCtx.setVisual('fail');
-              alert('Download failed');
-              setTimeout(() => dlCtx.setVisual('save'), 3000);
-            },
-          });
+          return downloadBlob(media.url, lessonName + '.mp4', dlCtx);
+        })
+        .then(() => {
+          activeDownloads.delete(bbbId);
+          dlCtx.setVisual('ok');
+          setTimeout(() => dlCtx.setVisual('save'), 3000);
         })
         .catch((err) => {
           activeDownloads.delete(bbbId);
@@ -236,10 +264,10 @@
   attachControls();
 
   setInterval(() => {
-    const unprocessed = document.querySelector('a.link_vc_date[data-bbb-id]');
-    if (unprocessed) {
-      const li = unprocessed.closest('li');
-      if (li && !li.querySelector('.polito-vc-controls')) attachControls();
-    }
+    const pending = [...document.querySelectorAll('a.link_vc_date[data-bbb-id]')].some((a) => {
+      const li = a.closest('li');
+      return li && !li.querySelector('.polito-vc-controls');
+    });
+    if (pending) attachControls();
   }, 500);
 })();
