@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Polito VC – lecture checkboxes & download
 // @namespace    https://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Lecture completion checkboxes & video download for Polito Virtual Classroom
 // @match        https://didattica.polito.it/pls/portal30/sviluppo.pagina_corso_2023.main*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
+// @grant        GM_download
 // @connect      video.polito.it
 // @connect      didattica.polito.it
 // @connect      ssrweb.zoom.us
@@ -62,6 +63,7 @@
 
   const STORAGE_KEY = 'polito_vc_lesson_completed_v1';
   const VC_TPL_URL = 'https://didattica.polito.it/pls/portal30/sviluppo.virtual_classroom.getVCTpl';
+  const CHUNK_SIZE = 8 * 1024 * 1024;
   const activeDownloads = new Map();
 
   function loadState() {
@@ -81,6 +83,19 @@
         ontimeout: () => reject(new Error('request timed out')),
       }, details));
     });
+  }
+
+  function headerValue(resp, name) {
+    const raw = resp.responseHeaders || '';
+    const lines = Array.isArray(raw) ? raw : String(raw).split('\n');
+    const lower = name.toLowerCase();
+    for (const line of lines) {
+      const idx = line.indexOf(':');
+      if (idx > 0 && line.slice(0, idx).trim().toLowerCase() === lower) {
+        return line.slice(idx + 1).trim();
+      }
+    }
+    return null;
   }
 
   function fetchVCTpl(bbbId, idInc, idIncProv) {
@@ -120,7 +135,18 @@
       });
   }
 
-  function downloadBlob(url, name, dlCtx) {
+  function saveBlob(blob, name) {
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+  }
+
+  function fetchWhole(url, dlCtx) {
     return gmRequest({
       method: 'GET',
       url: url,
@@ -129,18 +155,84 @@
         if (p.total > 0) {
           dlCtx.pct = Math.round((p.loaded / p.total) * 100);
           dlCtx.setVisual('refresh', dlCtx.pct + '%');
+        } else {
+          dlCtx.setVisual('refresh', '…');
         }
       },
-    }).then((resp) => {
-      const blobUrl = URL.createObjectURL(resp.response);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = name;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+    }).then((resp) => resp.response);
+  }
+
+  function fetchChunked(url, dlCtx) {
+    return gmRequest({
+      method: 'GET',
+      url: url,
+      responseType: 'arraybuffer',
+      headers: { Range: 'bytes=0-0' },
+    }).then((probe) => {
+      const range = headerValue(probe, 'content-range');
+      const total = range ? Number(range.split('/')[1]) : 0;
+      if (!total) throw new Error('server does not support ranged download');
+
+      const parts = [];
+      let received = 0;
+
+      const next = (start) => {
+        if (start >= total) {
+          dlCtx.pct = 100;
+          dlCtx.setVisual('refresh', '100%');
+          return Promise.resolve(new Blob(parts, { type: 'video/mp4' }));
+        }
+        const end = Math.min(start + CHUNK_SIZE - 1, total - 1);
+        return gmRequest({
+          method: 'GET',
+          url: url,
+          responseType: 'arraybuffer',
+          headers: { Range: 'bytes=' + start + '-' + end },
+        }).then((resp) => {
+          parts.push(resp.response);
+          received += end - start + 1;
+          dlCtx.pct = Math.round(Math.min(received, total) / total * 100);
+          dlCtx.setVisual('refresh', dlCtx.pct + '%');
+          return next(start + CHUNK_SIZE);
+        });
+      };
+
+      return next(0);
     });
+  }
+
+  function gmDownload(url, name, onprogress) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_download !== 'function') { reject(new Error('GM_download unavailable')); return; }
+      const details = {
+        url: url,
+        name: name,
+        saveAs: false,
+        onload: () => resolve('ok'),
+        onerror: () => reject(new Error('GM_download failed')),
+        ontimeout: () => reject(new Error('GM_download timed out')),
+      };
+      if (onprogress) details.onprogress = onprogress;
+      GM_download(details);
+    });
+  }
+
+  function fetchMedia(url, name, dlCtx) {
+    const progress = (p) => {
+      const total = p && (p.total || 0);
+      if (total > 0) {
+        dlCtx.pct = Math.round((p.loaded / total) * 100);
+        dlCtx.setVisual('refresh', dlCtx.pct + '%');
+      } else {
+        dlCtx.setVisual('refresh', '…');
+      }
+    };
+    return gmDownload(url, name, null)
+      .catch(() => gmDownload(url, name, progress))
+      .catch(() => fetchWhole(url, dlCtx).then((blob) => {
+        saveBlob(blob, name);
+        return 'ok';
+      }));
   }
 
   const ICON_CLS = {
@@ -199,10 +291,11 @@
           if (media.kind === 'zoom') {
             dlCtx.setVisual('refresh', '…');
             const playUrl = media.url;
-            return resolveZoomMp4(playUrl).then((mp4Url) => downloadBlob(mp4Url, lessonName + '.mp4', dlCtx))
+            return resolveZoomMp4(playUrl)
+              .then((mp4Url) => fetchMedia(mp4Url, lessonName + '.mp4', dlCtx))
               .catch(() => { window.open(playUrl, '_blank', 'noopener'); });
           }
-          return downloadBlob(media.url, lessonName + '.mp4', dlCtx);
+          return fetchMedia(media.url, lessonName + '.mp4', dlCtx);
         })
         .then(() => {
           activeDownloads.delete(bbbId);
